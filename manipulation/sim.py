@@ -1,5 +1,11 @@
 import numpy as np
 import pybullet as p
+from argparse import Namespace
+import isaacgym
+from isaacgym import gymutil
+from isaacgym import gymtorch
+from isaacgym import gymapi
+from manipulation.gym_info import *
 import gym
 from gym.utils import seeding
 from gym import spaces
@@ -8,14 +14,52 @@ import yaml
 import os.path as osp
 from collections import defaultdict
 from scipy.spatial.transform import Rotation as R
-from manipulation.panda import Panda
+from manipulation.panda import Panda, PandaIsaac
 from manipulation.ur5 import UR5
 from manipulation.sawyer import Sawyer
 from manipulation.utils import parse_config, load_env, download_and_parse_objavarse_obj_from_yaml_config
 from manipulation.gpt_reward_api import get_joint_id_from_name, get_link_id_from_name
 
+
+def parse_sim_params(gravity):
+    sim_params = gymapi.SimParams()
+    sim_params.dt = sim_params_dt
+    sim_params.num_client_threads = 0
+
+    sim_params.physx.solver_type = sim_params_physx_solver_type
+    sim_params.physx.num_position_iterations = sim_params_physx_num_position_iterations
+    sim_params.physx.num_velocity_iterations = sim_params_physx_num_velocity_iterations
+    sim_params.physx.num_threads = sim_params_physx_num_threads
+    sim_params.physx.use_gpu = True
+    sim_params.physx.num_subscenes = 0
+    sim_params.physx.max_gpu_contact_pairs = sim_params_physx_max_gpu_contact_pairs
+    sim_params.physx.rest_offset = sim_params_physx_rest_offset
+    sim_params.physx.bounce_threshold_velocity = sim_params_physx_bounce_threshold_velocity
+    sim_params.physx.max_depenetration_velocity = sim_params_physx_max_depenetration_velocity
+    sim_params.physx.default_buffer_size_multiplier = sim_params_physx_default_buffer_size_multiplier
+    sim_params.physx.contact_offset = sim_params_physx_contact_offset
+
+    sim_params.use_gpu_pipeline = True
+    sim_params.physx.use_gpu = True
+
+    # Set gravity
+    sim_params.up_axis = gymapi.UP_AXIS_Z
+    sim_params.gravity.x = 0
+    sim_params.gravity.y = 0
+    sim_params.gravity.z = gravity
+
+    # Set Isaac device parameters
+    isaac_params = Namespace()
+    isaac_params.device_id = 0
+    isaac_params.graphics_device_id = isaac_params.device_id
+    isaac_params.device = "cuda" if sim_params.use_gpu_pipeline else "cpu"
+
+    isaac_params.physics_engine = gymapi.SIM_PHYSX
+
+    return sim_params, isaac_params
+
 class SimpleEnv(gym.Env):
-    def __init__(self, 
+    def __init__(self,
                     dt=0.01, 
                     config_path=None, 
                     gui=False, 
@@ -63,6 +107,10 @@ class SimpleEnv(gym.Env):
         self.suction_contact_link = None
         self.suction_obj_id = None
         self.activated = 0
+
+        self.gym = gymapi.acquire_gym()
+        self.sim_params, self.isaac_params = parse_sim_params(self.gravity)
+
         
         if self.gui:
             try:
@@ -77,6 +125,7 @@ class SimpleEnv(gym.Env):
         p.setTimeStep(1.0 / hz, physicsClientId=self.id)
 
         self.seed()
+        self.set_scene_isaac()
         self.set_scene()
         self.setup_camera_rpy()
         self.scene_lower, self.scene_upper = self.get_scene_bounds()
@@ -184,6 +233,75 @@ class SimpleEnv(gym.Env):
                 -7.35304443e-01]
         return init_joint_angles
 
+    def render_isaac(self):
+        if self.viewer:
+            # check for window closed
+            if self.gym.query_viewer_has_closed(self.viewer):
+                import sys
+                sys.exit()
+
+            # check for keyboard events
+            for evt in self.gym.query_viewer_action_events(self.viewer):
+                if evt.action == "QUIT" and evt.value > 0:
+                    import sys
+                    sys.exit()
+                elif evt.action == "toggle_viewer_sync" and evt.value > 0:
+                    self.enable_viewer_sync = not self.enable_viewer_sync
+
+            # fetch results
+            if self.isaac_params.device != "cpu":
+                self.gym.fetch_results(self.sim, True)
+
+            # step graphics
+            if self.enable_viewer_sync:
+                self.gym.step_graphics(self.sim)
+                self.gym.draw_viewer(self.viewer, self.sim, True)
+            else:
+                self.gym.poll_viewer_events(self.viewer)
+
+    def set_viewer(self):
+        self.enable_viewer_sync = True
+        self.viewer = None
+        if self.gui:
+            self.viewer = self.gym.create_viewer(
+                self.sim, gymapi.CameraProperties())
+            self.gym.subscribe_viewer_keyboard_event(
+                self.viewer, gymapi.KEY_ESCAPE, "QUIT")
+            self.gym.subscribe_viewer_keyboard_event(
+                self.viewer, gymapi.KEY_V, "toggle_viewer_sync")
+
+            # cam_pos = gymapi.Vec3(-0.72296342, 1.12149867, 0.83743687)
+            # cam_target = gymapi.Vec3(-0.2, 0, 0.4)
+            cam_pos = gymapi.Vec3(-2.72296342, 3.12149867, 2.83743687)
+            cam_target = gymapi.Vec3(-0.2, 0, -0.4)
+
+            self.gym.viewer_camera_look_at(
+                self.viewer, None, cam_pos, cam_target)
+
+    def set_scene_isaac(self):
+        self.sim = self.gym.create_sim(self.isaac_params.device_id, self.isaac_params.graphics_device_id,
+            self.isaac_params.physics_engine, self.sim_params)
+        if self.sim is None:
+            print("*** Failed to create sim")
+            assert False
+
+        self.set_viewer()
+
+        # TODO Restore state
+        restore_state = None
+
+        # Load plane
+        plane_params = gymapi.PlaneParams()
+        plane_params.normal = gymapi.Vec3(0., 0., 1.)
+        plane_params.static_friction = plane_params_static_friction
+        plane_params.dynamic_friction = plane_params_dynamic_friction
+        self.gym.add_ground(self.sim, plane_params)
+
+        self.render_isaac()
+
+        # Load robot
+        robot_base_pos = self.load_robot_isaac(restore_state)
+
     def set_scene(
         self,
     ):
@@ -272,14 +390,14 @@ class SimpleEnv(gym.Env):
             "ur5": UR5,
         }
         robot_names = list(robot_classes.keys())
-        self.robot_name = robot_names[np.random.randint(len(robot_names))]
+        self.robot_name = 'panda'  # robot_names[np.random.randint(len(robot_names))]
         if restore_state is not None and "robot_name" in restore_state:
             self.robot_name = restore_state['robot_name']
         self.robot_class = robot_classes[self.robot_name]
       
         # Create robot
         self.robot = self.robot_class()
-        self.robot.init(self.asset_dir, self.id, self.np_random, fixed_base=True, use_suction=self.use_suction)
+        self.robot.init(self.asset_dir, self.np_random, fixed_base=True, use_suction=self.use_suction)
         self.agents = [self.robot]
         self.suction_id = self.robot.right_gripper_indices[0]
 
@@ -295,7 +413,24 @@ class SimpleEnv(gym.Env):
         init_joint_angles = self.get_robot_init_joint_angles()
         self.robot.set_joint_angles(self.robot.right_arm_joint_indices, init_joint_angles)    
         
-        return robot_base_pos        
+        return robot_base_pos
+
+    def load_robot_isaac(self, restore_state):
+        robot_classes = {
+            "panda": PandaIsaac,
+            "sawyer": Sawyer,
+            "ur5": UR5,
+        }
+        robot_names = list(robot_classes.keys())
+        self.robot_name = 'panda'  # robot_names[np.random.randint(len(robot_names))]
+        assert self.robot_name == 'panda', "Robots other than panda require setting up their classes with isaacgym"
+        if restore_state is not None and "robot_name" in restore_state:
+            self.robot_name = restore_state['robot_name']
+        self.robot_class = robot_classes[self.robot_name]
+
+        # Create robot
+        self.robot = self.robot_class(self.sim, self.gym)
+        self.robot.init(self.asset_dir, self.id, self.np_random, fixed_base=True, use_suction=self.use_suction)
     
     def load_and_parse_config(self, restore_state):
         ### select and download objects from objaverse

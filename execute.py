@@ -1,13 +1,15 @@
 import yaml
+import isaacgym
 import os
 from RL.ray_learn import run_RL
 import numpy as np
 import pybullet as p
+from isaacgym import gymutil
 import time, datetime
 import json
 from manipulation.utils import save_numpy_as_gif, save_env, take_round_images, build_up_env, load_gif
 
-def execute_primitive(task_config, solution_path, substep, last_restore_state_file, save_path, 
+def execute_primitive(task_config, solution_path, substep, last_restore_state_file, save_path,
                       gui=False, randomize=False, obj_id=0):
     # build the env
     task_name = substep.replace(" ", "_")
@@ -88,7 +90,7 @@ def test_env(solution_path, time_string, substeps, action_spaces, meta_info, ran
         json.dump(meta_info, f)
     return 
 
-def execute(task_config_path, 
+def execute(task_config_path,
             time_string=None, resume=False, # these two are combined for resume training.
             training_algo='RL_sac', 
             gui=False, 
@@ -269,7 +271,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     task_config_path = args.task_config_path
-    execute(task_config_path, resume=args.resume, training_algo=args.training_algo, time_string=args.time_string, 
+    execute(task_config_path, resume=args.resume, training_algo=args.training_algo, time_string=args.time_string,
             gui=args.gui, 
             randomize=args.randomize,
             use_bard=args.use_bard,
